@@ -27,8 +27,13 @@ def extract_code(model_output: str, lmstyle: LMStyle):
         indexlines = [i for i, line in enumerate(outputlines) if "```" in line]
         if len(indexlines) < 2:
             return ""
-        # return "\n".join(outputlines[indexlines[0] + 1 : indexlines[1]])
-        return "\n".join(outputlines[indexlines[-2] + 1 : indexlines[-1]])
+        blocks = []
+        for j in range(0, len(indexlines) - 1, 2):
+            block = "\n".join(outputlines[indexlines[j] + 1 : indexlines[j + 1]])
+            blocks.append(block)
+        if not blocks:
+            return ""
+        return max(blocks, key=len)
 
 
 def extract_test_output_code(model_output: str, lmstyle: LMStyle = None):
