@@ -23,7 +23,7 @@ from time import time, time_ns
 from typing import Any, ClassVar, Dict, List, Optional, Union
 
 from aiohttp.client_exceptions import ClientResponseError
-from fastapi import Request
+from fastapi import HTTPException, Request
 from pydantic import Field
 
 from nemo_gym.base_responses_api_model import (
@@ -52,6 +52,27 @@ from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_entrypoint
 
 
 LOG = logging.getLogger("nemo_gym.vllm_model")
+
+def _context_length_error_detail(error: ClientResponseError) -> dict[str, Any] | None:
+    """Recognize typed and stock-vLLM context errors without masking other 400s."""
+    if error.status != 400:
+        return None
+    text = error.response_content.decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        detail = payload.get("error", payload)
+        if isinstance(detail, dict) and detail.get("code") == "context_length_exceeded":
+            return detail
+    lowered = text.lower()
+    if "context length" in lowered or "max_model_len" in lowered or (
+        "max_tokens" in lowered and ("too large" in lowered or "exceed" in lowered)
+    ):
+        return {"code": "context_length_exceeded", "type": "invalid_request_error", "message": text}
+    return None
+
 
 _TRANSPORT_LOG_CONTEXT_HEADERS = {
     "run_id": "x-nemo-gym-log-run-id",
@@ -677,17 +698,13 @@ class VLLMModel(SimpleResponsesAPIModel):
             3. https://github.com/vllm-project/vllm/blob/685c99ee77b4818dcdd15b30fe0e0eff0d5d22ec/vllm/entrypoints/openai/serving_engine.py#L948
             4. https://github.com/vllm-project/vllm/blob/685c99ee77b4818dcdd15b30fe0e0eff0d5d22ec/vllm/sampling_params.py#L463
             """
-            result_content_str = e.response_content.decode()
-
-            is_out_of_context_length = e.status == 400 and (
-                "context length" in result_content_str or "max_tokens" in result_content_str
-            )
-            if is_out_of_context_length:
-                res = self._create_empty_chat_completion()
-                res.choices[0].finish_reason = "length"
-                return res
-            else:
-                raise e
+            context_error = _context_length_error_detail(e)
+            if context_error is not None:
+                # Agents retain their last token-authoritative response and
+                # mask a context-rejected rollout. A fake empty completion
+                # would overwrite that response and mislabel the termination.
+                raise HTTPException(status_code=400, detail={"error": context_error}) from e
+            raise
         except Exception as e:
             if transport_io_enabled:
                 finished_ns = time_ns()
@@ -986,14 +1003,9 @@ class VLLMModel(SimpleResponsesAPIModel):
         try:
             completion_dict = await client.create_completion(**completion_body)
         except ClientResponseError as e:
-            result_content_str = e.response_content.decode()
-            is_out_of_context_length = e.status == 400 and (
-                "context length" in result_content_str or "max_tokens" in result_content_str
-            )
-            if is_out_of_context_length:
-                res = self._create_empty_chat_completion()
-                res.choices[0].finish_reason = "length"
-                return res
+            context_error = _context_length_error_detail(e)
+            if context_error is not None:
+                raise HTTPException(status_code=400, detail={"error": context_error}) from e
             raise
 
         if self.config.return_token_id_information:

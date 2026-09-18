@@ -20,6 +20,9 @@ image_tools_simple_agent:
           name: gui_coordinate
       max_steps: 21
       max_output_tokens: 4096
+      # Optional safety bounds. The standalone GRPO bundle sets these explicitly.
+      max_total_sequence_length: null
+      max_images: null
       stop_strings: ["</tool_call>"]
       include_stop_str_in_output: true
       crop_dir: image_tool_outputs

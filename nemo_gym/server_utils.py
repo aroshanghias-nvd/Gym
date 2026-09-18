@@ -205,8 +205,14 @@ DISCONNECTED_CLIENT_OS_HELP_TEXT = """We've run into this issue in two different
 
 
 async def request(
-    method: str, url: str, _internal: bool = False, **kwargs: Unpack[_RequestOptions]
+    method: str,
+    url: str,
+    _internal: bool = False,
+    _max_connection_retries: Optional[int] = None,
+    **kwargs: Unpack[_RequestOptions],
 ) -> ClientResponse:  # pragma: no cover
+    if _max_connection_retries is not None and _max_connection_retries < 1:
+        raise ValueError("_max_connection_retries must be at least 1 when set")
     # Faster JSON dumps than the default aiohttp json
     if kwargs.get("json"):
         kwargs["data"] = orjson.dumps(kwargs.pop("json"))
@@ -220,6 +226,10 @@ async def request(
     while True:
         try:
             return await client.request(method=method, url=url, **kwargs)
+        except TypeError:
+            # Invalid request arguments cannot recover by retrying. In particular,
+            # never hide transport API incompatibilities in the internal retry loop.
+            raise
         except ServerDisconnectedError:
             global _NUM_SERVER_DISCONNECTED_ERROR
             _NUM_SERVER_DISCONNECTED_ERROR += 1
@@ -231,7 +241,8 @@ async def request(
                     flush=True,
                 )
 
-            await asyncio.sleep(0.5)
+            if _max_connection_retries is not None and num_tries >= _max_connection_retries:
+                raise
         except ClientOSError:
             global _NUM_CLIENT_OS_ERROR
             _NUM_CLIENT_OS_ERROR += 1
@@ -243,10 +254,14 @@ async def request(
                     flush=True,
                 )
 
-            await asyncio.sleep(0.5)
+            if _max_connection_retries is not None and num_tries >= _max_connection_retries:
+                raise
         except Exception as e:
             if _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG:
                 print_exc()
+
+            if _max_connection_retries is not None and num_tries >= _max_connection_retries:
+                raise
 
             # Don't increment internal since we know we are ok. If we are not, the head server will shut everything down anyways.
             if not _internal:
@@ -258,9 +273,17 @@ Sleeping 0.5s and retrying...
                 if num_tries >= MAX_NUM_TRIES:
                     raise e
 
-                num_tries += 1
+        num_tries += 1
+        await asyncio.sleep(0.5)
 
-            await asyncio.sleep(0.5)
+
+def is_context_length_exceeded_error(error: BaseException, response_body: Any) -> bool:
+    """Recognize a typed, non-retryable context rejection from the model server."""
+    if getattr(error, "status", None) != 400:
+        return False
+    if isinstance(response_body, bytes):
+        response_body = response_body.decode("utf-8", errors="replace")
+    return "context_length_exceeded" in str(response_body)
 
 
 async def raise_for_status(response: ClientResponse) -> None:  # pragma: no cover
@@ -326,7 +349,13 @@ class ServerClient(BaseModel):
         return f"http://{server_config_dict.host}:{server_config_dict.port}"
 
     async def request(
-        self, server_name: str, url_path: str, method: str, **kwargs: Unpack[_RequestOptions]
+        self,
+        server_name: str,
+        url_path: str,
+        method: str,
+        *,
+        max_connection_attempts: Optional[int] = None,
+        **kwargs: Unpack[_RequestOptions],
     ) -> ClientResponse:
         server_config_dict = get_first_server_config_dict(self.global_config_dict, server_name)
         base_url = self._build_server_base_url(server_config_dict)
@@ -356,7 +385,13 @@ class ServerClient(BaseModel):
         ):
             url_path = f"{rollout_path_prefix(rollout_id)}{url_path}"
 
-        return await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
+        return await request(
+            method=method,
+            url=f"{base_url}{url_path}",
+            _internal=True,
+            _max_connection_retries=max_connection_attempts,
+            **kwargs,
+        )
 
     async def get(
         self,

@@ -1,0 +1,52 @@
+{
+  "artifact": "gymnasium-1.1.1-py3-none-any.whl",
+  "sha256": "8b2339261037f409b17b6487a1a5880cbfe0cf79f41b350c3259cc4b4f46d67e",
+  "source": {
+    "repository": "https://github.com/visgym/VIsGym.git",
+    "revision": "927271d107ad0196ad6aa597095ca57d01c6ddbb",
+    "commit_timestamp": 1777843310
+  },
+  "build": {
+    "script": "../scripts/build_visgym_wheel.sh",
+    "constraints": "../scripts/visgym-wheel-build-constraints.txt",
+    "source_date_epoch": 1777843310,
+    "python": "3.13.14",
+    "pip": "26.2.1",
+    "setuptools": "84.0.0",
+    "added_source_file": {
+      "source": "../vendor_licenses/gymnasium-v1.1.1-LICENSE",
+      "destination": "LICENSE-GYMNASIUM-v1.1.1",
+      "sha256": "7dacaa9772e856aee6943b32ef663d3634d91d72ec7bbc74d136943673f91e18"
+    }
+  },
+  "distribution": {
+    "name": "gymnasium",
+    "version": "1.1.1",
+    "root_is_purelib": true,
+    "tag": "py3-none-any"
+  },
+  "license_evidence": {
+    "wheel_metadata": {
+      "license": "MIT License",
+      "classifier": "License :: OSI Approved :: MIT License"
+    },
+    "visgym": {
+      "root_license_spdx": "Apache-2.0",
+      "wheel_license_path": "gymnasium-1.1.1.dist-info/licenses/LICENSE",
+      "wheel_notice_path": "gymnasium-1.1.1.dist-info/licenses/NOTICE"
+    },
+    "gymnasium_v1_1_1": {
+      "repository": "https://github.com/Farama-Foundation/Gymnasium.git",
+      "tag": "v1.1.1",
+      "revision": "17eff00220d210beda933f78b0e52850022b0690",
+      "source_path": "LICENSE",
+      "source_sha256": "7dacaa9772e856aee6943b32ef663d3634d91d72ec7bbc74d136943673f91e18",
+      "local_copy": "../vendor_licenses/gymnasium-v1.1.1-LICENSE",
+      "wheel_license_path": "gymnasium-1.1.1.dist-info/licenses/LICENSE-GYMNASIUM-v1.1.1"
+    },
+    "review": {
+      "status": "maintainer-and-legal-review-required-before-redistribution",
+      "reason": "The squash-created VisGym repository retains MIT package metadata and substantial Gymnasium v1.1.1 code, but its tree and history contain only an Apache-2.0 root LICENSE plus a VisGym NOTICE. Embedding both source notices preserves them mechanically; it does not resolve the upstream licensing inconsistency or establish a dual-license grant."
+    }
+  }
+}

@@ -941,10 +941,14 @@ class ImageToolsGymToolLogic:
                             break
                     seen_for_image.append(bbox)
 
+                # Fan out retained tool outputs to avoid large flat directories
+                # on shared storage during long multi-turn training runs.
+                tool_output_id = str(uuid.uuid4())
                 sample_work_dir = os.path.join(
                     self.crop_dir,
                     str(next_metadata.get("dataset", "unknown")),
-                    str(uuid.uuid4()),
+                    tool_output_id[:2],
+                    tool_output_id,
                 )
                 result = execute_image_tool(
                     tool_name,

@@ -1,0 +1,69 @@
+# Full-episode GRPO bundle. No PivotRL agent or built-in benchmark datasets.
+# Combine with responses_api_models/vllm_model/configs/vllm_model_for_training.yaml.
+# Input rows select one of the three verifier routes via image_tools_base_agent_ref.
+image_tools_simple_agent:
+  responses_api_agents:
+    image_tools_agent:
+      entrypoint: app.py
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resource_servers_by_agent:
+        string_match_simple_agent:
+          type: resources_servers
+          name: string_match
+        math_with_judge_simple_agent:
+          type: resources_servers
+          name: math_with_judge
+        mcqa_simple_agent:
+          type: resources_servers
+          name: mcqa
+      # Preserve the upstream tool horizon; explicitly match our current model
+      # token cap. These are standalone settings, not overrides to the games.
+      max_steps: 21
+      max_tool_calls: 20
+      max_tool_calls_per_turn: 1
+      max_output_tokens: 512
+      max_total_sequence_length: 32768
+      max_images: 21
+      stop_strings: ["</tool_call>"]
+      include_stop_str_in_output: true
+      # Required run-scoped path; do not write crops into an immutable snapshot.
+      crop_dir: ${oc.env:IMAGE_TOOLS_OUTPUT_DIR}
+      crop_format: jpeg
+      crop_jpeg_quality: 95
+      crop_min_pixels: 262144
+      crop_max_pixels: 1048576
+      # Preserve upstream GRPO shaping while reporting task_success separately.
+      tool_success_reward: 0.02
+      tool_success_reward_cap: 0.20
+      invalid_tool_call_penalty: -0.05
+      duplicate_tool_call_penalty: -0.02
+      force_final_after_duplicate: true
+      terminate_on_invalid_tool_call: true
+      duplicate_iou_threshold: 0.5
+string_match:
+  resources_servers:
+    string_match:
+      entrypoint: app.py
+      domain: knowledge
+      verified: false
+math_with_judge:
+  resources_servers:
+    math_with_judge:
+      entrypoint: app.py
+      domain: math
+      verified: false
+      judge_model_server:
+        type: responses_api_models
+        name: policy_model
+      judge_responses_create_params:
+        input: []
+      should_use_judge: false
+mcqa:
+  resources_servers:
+    mcqa:
+      entrypoint: app.py
+      domain: knowledge
+      verified: false
+      grading_mode: null

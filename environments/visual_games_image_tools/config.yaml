@@ -1,0 +1,39 @@
+# Local integration bundle. Runtime qualification and mixed training pending.
+# Independent resources servers keep Gym-V and VisGym Gymnasium dependencies
+# isolated; image_tools uses its own agent and the three existing graders.
+config_paths:
+  - resources_servers/gym_v/configs/gym_v.yaml
+  - resources_servers/visgym/configs/visgym_requested_thinking_agent.yaml
+  - environments/image_tools_grpo/config.yaml
+
+gym_v_resources_server:
+  resources_servers:
+    gym_v:
+      # Match the final 34-game t512 recipe; not generic GRPO reward shaping.
+      valid_action_bonus: 0.05
+      valid_action_bonus_max: 0.25
+gym_v_agent:
+  responses_api_agents:
+    gymv_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: gym_v_resources_server
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: 8
+      max_total_sequence_length: 32768
+      done_if_no_boxed_answer: true
+      max_no_boxed_retries: 0
+      return_transitions: false
+visgym_agent:
+  responses_api_agents:
+    visgym_agent:
+      # Match the final games-only recipe; each task's smaller horizon still
+      # wins. This is not a new horizon or curriculum decision.
+      max_steps: 35
+      max_total_sequence_length: 32768
+      done_if_no_boxed_answer: true
+      max_no_boxed_truncation_retries: 0
+      no_boxed_truncation_retry_factor: 1.0

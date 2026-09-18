@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The upstream pyproject only declares setuptools>=61. Pin the isolated build
+# backend so build_visgym_wheel.sh produces a byte-for-byte candidate artifact.
+setuptools==84.0.0

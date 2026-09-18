@@ -4,12 +4,16 @@
 import asyncio
 import base64
 import json
+import logging
+import time
+import uuid
 from io import BytesIO
 from typing import Any, Optional
 
+import aiohttp
 from fastapi import Request, Response
 from PIL import Image
-from pydantic import ConfigDict, PrivateAttr
+from pydantic import ConfigDict, Field, PositiveInt, PrivateAttr
 
 from nemo_gym.base_resources_server import (
     AggregateMetrics,
@@ -23,6 +27,7 @@ from nemo_gym.base_responses_api_agent import (
     Body,
     SimpleResponsesAPIAgent,
 )
+from nemo_gym.compact_rollout_diagnostics import append_compact_rollout_diagnostic
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
@@ -39,11 +44,29 @@ from resources_servers.image_tools import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+def is_context_length_exceeded_error(error: BaseException, response_body: Any) -> bool:
+    """Recognize the model server's typed, non-retryable context rejection."""
+    if getattr(error, "status", None) != 400:
+        return False
+    if isinstance(response_body, bytes):
+        response_body = response_body.decode("utf-8", errors="replace")
+    return "context_length_exceeded" in str(response_body)
+
+
 class ImageToolsAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
     resource_servers_by_agent: dict[str, ResourcesServerRef]
-    max_steps: int = 5
-    max_output_tokens: Optional[int] = 4096
+    max_steps: PositiveInt = 5
+    max_output_tokens: Optional[PositiveInt] = 4096
+    max_total_sequence_length: Optional[PositiveInt] = Field(
+        default=None, description="Optional context headroom bound; new images still require server-side validation."
+    )
+    max_images: Optional[PositiveInt] = Field(
+        default=None, description="Maximum images in a model request, including tool results."
+    )
     stop_strings: list[str] = ["</tool_call>"]
     include_stop_str_in_output: bool = True
     crop_dir: str = "image_tool_outputs"
@@ -51,8 +74,8 @@ class ImageToolsAgentConfig(BaseResponsesAPIAgentConfig):
     crop_jpeg_quality: int = 95
     crop_min_pixels: int = 262144
     crop_max_pixels: int = 1048576
-    max_tool_calls: int = 4
-    max_tool_calls_per_turn: int = 1
+    max_tool_calls: int = Field(default=4, ge=0)
+    max_tool_calls_per_turn: PositiveInt = 1
     tool_success_reward: float = 0.02
     tool_success_reward_cap: float = 0.05
     invalid_tool_call_penalty: float = -0.05
@@ -82,6 +105,8 @@ class ImageToolsAgentVerifyResponse(BaseVerifyResponse):
     image_tools_output_paths: list[str] = []
     image_tools_generation_image_paths: list[list[str]] = []
     image_tools_base_agent_ref: Optional[dict[str, Any]] = None
+    image_tools_executed_output_ids: list[str] = []
+    task_success: bool = False
 
 
 def _pil_to_data_url(path: str, fmt: str = "JPEG") -> str:
@@ -277,8 +302,31 @@ class ImageToolsAgent(SimpleResponsesAPIAgent):
         aux_reward = 0.0
         generation_image_paths: list[list[str]] = [[]]
         final_response: Optional[NeMoGymResponse] = None
+        executed_output_ids: list[str] = []
+        started = time.monotonic()
+        model_calls = 0
+        generated_tokens = 0
+        termination_reason = "max_steps"
 
-        for _ in range(self.config.max_steps):
+        for step in range(self.config.max_steps):
+            if self.config.max_images is not None and len(metadata["image_paths"]) > self.config.max_images:
+                termination_reason = "max_images"
+                break
+            # This is a lower-bound check, not exact tokenization of new crops.
+            # A typed server rejection below handles the remaining image/prompt growth.
+            if final_response is not None and self.config.max_total_sequence_length is not None:
+                completed_lengths = [
+                    len(item.prompt_token_ids) + len(item.generation_token_ids)
+                    for item in final_response.output
+                    if getattr(item, "prompt_token_ids", None) is not None
+                    and getattr(item, "generation_token_ids", None) is not None
+                ]
+                if (
+                    completed_lengths
+                    and max(completed_lengths) + (body.max_output_tokens or 1) >= self.config.max_total_sequence_length
+                ):
+                    termination_reason = "max_total_sequence_length"
+                    break
             base_input = (
                 [NeMoGymEasyInputMessage(role="user", content=body.input)]
                 if isinstance(body.input, str)
@@ -300,14 +348,54 @@ class ImageToolsAgent(SimpleResponsesAPIAgent):
                 metadata_extra["extra_body"] = json.dumps(current_extra)
                 model_body.metadata = metadata_extra
 
-            model_response, model_cookies = await self._call_model(model_body, model_cookies)
+            model_calls += 1
+            try:
+                model_response, model_cookies = await self._call_model(model_body, model_cookies)
+            except aiohttp.ClientResponseError as error:
+                if not is_context_length_exceeded_error(error, getattr(error, "response_content", "")):
+                    raise
+                logger.warning("Image-tool context limit reached; ending this rollout: step=%s", step)
+                termination_reason = "context_length_exceeded"
+                break
             new_outputs.extend(model_response.output)
-            usage = _response_usage_add(usage, model_response.usage)
+            usage = _response_usage_add(
+                usage, model_response.usage.model_copy(deep=True) if model_response.usage else None
+            )
             final_response = model_response
+            token_arrays = [
+                item.generation_token_ids
+                for item in model_response.output
+                if getattr(item, "generation_token_ids", None) is not None
+            ]
+            call_tokens = (
+                sum(map(len, token_arrays))
+                if token_arrays
+                else (model_response.usage.output_tokens if model_response.usage else 0)
+            )
+            generated_tokens += call_tokens
+            if body.max_output_tokens is not None and call_tokens > body.max_output_tokens:
+                logger.warning(
+                    "Image-tool response exceeded token budget; masking only this rollout: step=%s generated=%s cap=%s",
+                    step,
+                    call_tokens,
+                    body.max_output_tokens,
+                )
+                termination_reason = "model_token_budget_exceeded"
+                break
+            if getattr(model_response.incomplete_details, "reason", None) == "max_output_tokens":
+                termination_reason = "max_output_tokens"
+                break
 
             assistant_text = _extract_text_from_response(model_response)
             tool_calls = parse_image_tool_calls(assistant_text)
             malformed_tool_attempt = has_malformed_image_tool_markup(assistant_text)
+            if not assistant_text:
+                termination_reason = "empty_response"
+                break
+            # The last model call is reserved for an answer, not an unobserved crop.
+            if step == self.config.max_steps - 1 and (tool_calls or malformed_tool_attempt):
+                termination_reason = "max_steps"
+                break
 
             # process_nonterminal_turn executes the image tool: it decodes images,
             # runs PIL transforms and writes crops to disk, and for http(s) image
@@ -315,6 +403,8 @@ class ImageToolsAgent(SimpleResponsesAPIAgent):
             # from this async loop would stall the event loop for every other
             # concurrent rollout, so hand the whole synchronous call to a thread.
             # Keeping base.py synchronous matters -- the verifier imports it too.
+            previous_calls = metadata["tool_call_count"]
+            previous_errors = metadata["tool_error_count"]
             observation, reward, done, _, next_metadata, answer, _ = await asyncio.to_thread(
                 self._logic.process_nonterminal_turn,
                 [{"role": "assistant", "content": assistant_text}],
@@ -323,24 +413,71 @@ class ImageToolsAgent(SimpleResponsesAPIAgent):
             aux_reward += float(reward)
             if next_metadata is not None:
                 metadata = next_metadata
+            if (
+                tool_calls
+                and not malformed_tool_attempt
+                and metadata["tool_call_count"] - previous_calls == len(tool_calls)
+                and metadata["tool_error_count"] == previous_errors
+            ):
+                executed_output_ids.extend(
+                    item.id
+                    for item in model_response.output
+                    if getattr(item, "generation_token_ids", None)
+                    and getattr(item, "type", None) == "message"
+                    and getattr(item, "role", None) == "assistant"
+                )
             if not tool_calls and not malformed_tool_attempt:
+                termination_reason = "final_answer"
                 break
             if done:
+                termination_reason = "invalid_tool_call"
                 break
             if next_metadata is None:
                 break
 
-            user_message, crop_paths = self._tool_user_message(observation)
+            # Encoding may also be expensive and must not block other episodes.
+            user_message, crop_paths = await asyncio.to_thread(self._tool_user_message, observation)
+            if metadata["tool_call_count"] >= self.config.max_tool_calls or step == self.config.max_steps - 2:
+                metadata["force_final_next"] = True
+                final_instruction = self._logic.forced_final_prompt
+                if isinstance(user_message.content, str):
+                    user_message.content += "\n" + final_instruction
+                else:
+                    user_message.content.append({"type": "input_text", "text": final_instruction})
             new_outputs.append(user_message)
             generation_image_paths.append(crop_paths)
             if crop_paths:
                 aux_reward = min(aux_reward, self.config.tool_success_reward_cap)
 
         if final_response is None:
-            raise RuntimeError("ImageToolsAgent did not receive a model response")
+            final_response = NeMoGymResponse(
+                id=f"image-tools-{uuid.uuid4()}",
+                created_at=time.time(),
+                model=body.model or "policy_model",
+                object="response",
+                output=[],
+                parallel_tool_calls=False,
+                tool_choice="auto",
+                tools=[],
+            )
 
-        final_response = final_response.model_copy(update={"output": new_outputs, "usage": usage})
+        response_metadata = dict(final_response.metadata or {})
+        response_metadata["termination_reason"] = termination_reason
+        final_response = final_response.model_copy(
+            update={"output": new_outputs, "usage": usage, "metadata": response_metadata}
+        )
+        append_compact_rollout_diagnostic(
+            component="image_tools_agent",
+            game_name=str(row_metadata.get("env_id", "image_tools")),
+            duration_seconds=time.monotonic() - started,
+            model_calls=model_calls,
+            valid_environment_steps=metadata["tool_call_count"],
+            generated_tokens=generated_tokens,
+            no_boxed_retries=0,
+            termination_reason=termination_reason,
+        )
         rollout_info = {
+            "image_tools_executed_output_ids": executed_output_ids,
             "image_tools_aux_reward": aux_reward,
             "image_tools_call_count": int(metadata.get("tool_call_count", 0)),
             "image_tools_error_count": int(metadata.get("tool_error_count", 0)),
@@ -368,8 +505,16 @@ class ImageToolsAgent(SimpleResponsesAPIAgent):
             initial_cookies=cookies,
         )
 
+        termination_reason = model_response.metadata["termination_reason"]
         verify_request_body = body.model_dump()
-        verify_request_body["response"] = _final_assistant_response(model_response).model_dump()
+        # Never grade an earlier tool call as the final answer after a failed or
+        # exhausted episode. Passing empty output preserves grader response schemas.
+        grading_response = (
+            _final_assistant_response(model_response)
+            if termination_reason == "final_answer"
+            else (model_response.model_copy(update={"output": []}))
+        )
+        verify_request_body["response"] = grading_response.model_dump()
         verify_request = ImageToolsAgentVerifyRequest.model_validate(verify_request_body)
         verify_response = await self.server_client.post(
             server_name=resource_name,
@@ -380,11 +525,19 @@ class ImageToolsAgent(SimpleResponsesAPIAgent):
         await raise_for_status(verify_response)
         verify_response_json = await get_response_json(verify_response)
 
-        base_reward = float(verify_response_json.get("reward", 0.0))
+        base_reward = float(verify_response_json.get("reward", 0.0)) if termination_reason == "final_answer" else 0.0
         aux_reward = float(rollout_info["image_tools_aux_reward"])
         verify_response_json["base_reward"] = base_reward
         verify_response_json["image_tools_aux_reward"] = aux_reward
         verify_response_json["reward"] = base_reward + aux_reward
+        verify_response_json["task_success"] = base_reward >= 1.0
+        failure_reason = {
+            "context_length_exceeded": "context_length_exceeded",
+            "model_token_budget_exceeded": "generation_token_budget_exceeded",
+        }.get(termination_reason)
+        if failure_reason is not None:
+            verify_response_json["failure_reason"] = failure_reason
+            verify_response_json["instance_config"] = {"mask_sample": True}
         verify_response_json["image_tools_base_agent_ref"] = body.image_tools_base_agent_ref
         verify_response_json.update(rollout_info)
         verify_response_json["response"] = model_response.model_dump()
